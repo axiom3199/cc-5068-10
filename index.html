@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>声源来向分析台 · Acoustic Direction Lab</title>
+  <link rel="stylesheet" href="./src/ui/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <div>
+        <h1>声源来向分析台</h1>
+        <p>多通道 TDOA 方向估计 · 候选与可信范围 · 虚拟相机跟拍</p>
+      </div>
+    </div>
+    <div class="top-status">
+      <span id="statusPill" class="pill pill-idle">待分析</span>
+      <span id="poseReadout" class="readout">云台 pan 0.0° / tilt 0.0°</span>
+      <button id="helpBtn" class="btn btn-ghost" type="button">怎么启动</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- ======================= left: scene + array ======================= -->
+    <section class="col">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>阵列与场景</h2>
+          <span class="hint">下图为俯视（x 右 / z 前），拖动话筒可改布局</span>
+        </div>
+        <div class="preset-row">
+          <button class="btn btn-chip" data-layout="tetra" type="button">3D 四面体</button>
+          <button class="btn btn-chip" data-layout="square" type="button">水平方阵</button>
+          <button class="btn btn-chip" data-layout="triangle" type="button">三角阵</button>
+          <button class="btn btn-chip" data-layout="line" type="button">共线阵</button>
+          <button class="btn btn-chip" data-layout="stereo" type="button">双话筒</button>
+        </div>
+        <canvas id="planCanvas" width="640" height="360" aria-label="阵列俯视布局"></canvas>
+        <div class="mic-editor" id="micEditor"></div>
+        <p class="note" id="geometryNote"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>声源（仅用于合成录音）</h2>
+          <span class="hint">这些坐标只喂给合成器，绝不进入推断</span>
+        </div>
+        <div class="field-grid">
+          <label>世界方位角 <output id="srcAzOut">55.0°</output>
+            <input id="srcAz" type="range" min="-180" max="180" step="1" value="55" />
+          </label>
+          <label>世界俯仰角 <output id="srcElOut">18.0°</output>
+            <input id="srcEl" type="range" min="-60" max="80" step="1" value="18" />
+          </label>
+          <label>距离 <output id="srcDistOut">远场</output>
+            <input id="srcDist" type="range" min="0" max="12" step="0.05" value="0" />
+          </label>
+          <label>信噪比 <output id="srcSnrOut">24 dB</output>
+            <input id="srcSnr" type="range" min="-16" max="40" step="1" value="24" />
+          </label>
+        </div>
+        <label class="check"><input id="srcOn" type="checkbox" checked /> 声源存在</label>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>相机与云台</h2></div>
+        <div class="field-grid">
+          <label>Pan <output id="camPanOut">0.0°</output>
+            <input id="camPan" type="range" min="-180" max="180" step="0.5" value="0" />
+          </label>
+          <label>Tilt <output id="camTiltOut">0.0°</output>
+            <input id="camTilt" type="range" min="-40" max="60" step="0.5" value="0" />
+          </label>
+        </div>
+        <div class="btn-row">
+          <button id="followBtn" class="btn" type="button">跟拍：关</button>
+          <button id="probeBtn" class="btn btn-ghost" type="button">探针转头（排除镜像）</button>
+          <button id="recenterBtn" class="btn btn-ghost" type="button">云台回零</button>
+        </div>
+        <p class="note" id="followNote">关闭跟拍时云台不动；开启后由来向估计与跟踪器决定转向或暂缓。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>分析窗口与通道映射</h2></div>
+        <div class="field-grid">
+          <label>窗口起点 <output id="winStartOut">0.00 s</output>
+            <input id="winStart" type="range" min="0" max="0.8" step="0.01" value="0" />
+          </label>
+          <label>窗口长度 <output id="winLenOut">0.12 s</output>
+            <input id="winLen" type="range" min="0.03" max="0.5" step="0.005" value="0.12" />
+          </label>
+          <label>声速 c <output id="cOut">343 m/s</output>
+            <input id="cInput" type="range" min="300" max="380" step="1" value="343" />
+          </label>
+        </div>
+        <div class="btn-row">
+          <button id="scrambleBtn" class="btn btn-ghost" type="button">打乱录制通道</button>
+          <button id="resetChBtn" class="btn btn-ghost" type="button">恢复通道顺序</button>
+        </div>
+        <p class="note" id="channelMapNote"></p>
+      </div>
+    </section>
+
+    <!-- ========================= middle: views ========================= -->
+    <section class="col">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>方向与几何约束</h2>
+          <span class="hint">候选扇形 = 可信范围；虚线 = 平面阵镜像解；灰带 = 该对可能时差</span>
+        </div>
+        <canvas id="bearingCanvas" width="760" height="430" aria-label="方向几何视图"></canvas>
+        <div class="legend">
+          <span><i class="sw sw-truth"></i>仿真真值（仅校验）</span>
+          <span><i class="sw sw-best"></i>首选来向</span>
+          <span><i class="sw sw-alt"></i>候选/镜像</span>
+          <span><i class="sw sw-cred"></i>可信范围</span>
+          <span><i class="sw sw-cam"></i>相机视场</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>互相关峰（GCC-PHAT）</h2>
+          <select id="pairSelect" class="select" aria-label="选择通道对"></select>
+        </div>
+        <canvas id="xcorrCanvas" width="760" height="220" aria-label="互相关曲线"></canvas>
+        <p class="note" id="xcorrNote"></p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>相机取景（虚拟）</h2>
+          <span class="hint">由跟拍决定驱动；候选均以框标出</span>
+        </div>
+        <canvas id="cameraCanvas" width="760" height="300" aria-label="虚拟相机取景"></canvas>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>跟踪与决策</h2></div>
+        <div id="decisionBox" class="decision">尚未运行分析。</div>
+        <ol id="decisionLog" class="log"></ol>
+      </div>
+    </section>
+
+    <!-- ======================= right: results + audio ======================= -->
+    <section class="col">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>来向估计</h2>
+          <button id="analyzeBtn" class="btn btn-primary" type="button">分析当前窗口</button>
+        </div>
+        <div id="resultSummary" class="summary summary-idle">
+          <div class="summary-status">尚未分析</div>
+          <div class="summary-reason">点击「分析当前窗口」，结果只来自录音通道与几何参数。</div>
+        </div>
+        <div id="candidateList" class="cand-list"></div>
+        <div id="resultDetail" class="detail"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>通道试听与电平</h2>
+          <button id="stopBtn" class="btn btn-ghost" type="button">全部停止</button>
+        </div>
+        <div id="channelList" class="ch-list"></div>
+        <p class="note" id="audioNote">点击通道名试听该通道；麦克风索引与录制通道索引均标出。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>通道时差与残差</h2></div>
+        <div id="pairTable" class="pair-table"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>诊断</h2></div>
+        <pre id="diagBox" class="diag">等待分析…</pre>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="helpDialog">
+    <h2>如何启动与使用</h2>
+    <ol>
+      <li>在项目根目录执行 <code>npm start</code>（等同 <code>node server.mjs</code>），然后用浏览器打开终端里打印的地址，默认 <code>http://127.0.0.1:4173/</code>。</li>
+      <li>选择或拖动阵列布局，设定声源与云台位置，按「分析当前窗口」。</li>
+      <li>结果区给出首选来向、其他候选、可信范围与拟合残差；证据不足时会明确显示「证据不足」及原因，且不会给出可信方向。</li>
+      <li>「互相关峰」显示所选通道对的 GCC-PHAT 曲线、实测峰与几何允许的时差带；「方向与几何约束」显示候选扇形（俯视 + 侧视）。</li>
+      <li>「跟拍：开」后，跟踪器根据每帧结果决定转向或暂缓；平面阵出现镜像时先保持上次可信方向，用「探针转头」改变阵列姿态后可排除一支。</li>
+      <li>「通道试听」可单独播放各声道；「打乱录制通道」用于验证通道顺序确实被显式处理。</li>
+    </ol>
+    <p class="note">推断只接收 channels、sampleRate、通道映射、话筒位置与声速；页面上的仿真真值仅用于视觉校验，从不传入分析内核。</p>
+    <form method="dialog"><button class="btn btn-primary">知道了</button></form>
+  </dialog>
+
+  <script type="module" src="./src/ui/main.js"></script>
+</body>
+</html>

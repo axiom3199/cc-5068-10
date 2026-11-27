@@ -1,0 +1,20 @@
+{
+  "name": "acoustic-doa-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Multichannel time-difference-of-arrival direction finding and virtual camera tracking prototype",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
+    "test": "node tests/run-tests.mjs",
+    "validate": "node tests/run-tests.mjs --verbose",
+    "test:ui": "node tests/ui.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.1"
+  }
+}
