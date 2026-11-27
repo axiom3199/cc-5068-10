@@ -7,6 +7,10 @@
 //   4. physically rewiring channels while sending the channelMap keeps the answer
 //   5. removing the source yields an explicit "insufficient" rejection
 //   6. clicking the probe button turns the camera and re-analyses
+//   7. probe + cross-pose consistency prunes the mirror branch
+//   8. the follow loop slews the camera toward the confirmed source
+//   9. an injected channel swap is diagnosed, localized, and confirmed by re-run
+//  10. an injected mic dropout is told apart from a swap; logs stay bounded
 //
 // Run with the server already up:  node tests/ui-smoke.mjs [url]
 
@@ -195,6 +199,59 @@ const followPose = (await read()).pose;
 const near = Math.abs((((followPose.panDeg + 180) % 360) - 180) + 50) < 25;
 check('follow loop slews the camera toward the confirmed source', near,
   `pan=${followPose.panDeg.toFixed(1)}° (target ≈ -50°)`);
+
+// --- 9. injected channel swap is diagnosed, localized, and re-run-verified ----
+await page.evaluate(() => window.__doa.setScene({
+  layout: 'tetra', camera: { panDeg: 0, tiltDeg: 0 },
+  source: { azDeg: 70, elDeg: 15, distanceM: null, snrDb: 28, present: true },
+  wiring: null,
+}));
+await settle(); // establish the trusted reference on clean frames
+const swapDiag = await page.evaluate(() => {
+  window.__doa.injectFault({ type: 'swap', mics: [1, 2] });
+  const events = window.__doa.jumpEvents();
+  const ev = events.find((e) => e.kind === 'anomaly');
+  const verify = ev ? window.__doa.verifyJump(ev.id) : null;
+  const alert = document.getElementById('jumpAlert').textContent;
+  const detailShown = (() => {
+    if (!ev) return false;
+    window.__doa.selectJumpEvent(ev.id);
+    return document.getElementById('jumpEventDetail').textContent.length > 20;
+  })();
+  return ev ? {
+    cause: ev.cause, stage: ev.stage, mics: ev.implicatedMics,
+    conclusion: verify?.conclusion ?? null,
+    steps: verify?.steps?.map((x) => x.step) ?? [],
+    alert, detailShown,
+  } : { cause: null, alert };
+});
+check('injected channel swap raises a channel-swap anomaly localized to M1/M2 (tdoa stage)',
+  swapDiag.cause === 'channel-swap' && swapDiag.stage === 'tdoa'
+  && swapDiag.mics?.join(',') === '1,2',
+  `cause=${swapDiag.cause} stage=${swapDiag.stage} mics=[${swapDiag.mics ?? ''}]`);
+check('swap diagnosis is confirmed by re-running the recorded evidence',
+  swapDiag.conclusion === 'confirmed',
+  `conclusion=${swapDiag.conclusion} steps=[${(swapDiag.steps ?? []).join('>')}]`);
+check('the jump panel surfaces the anomaly and its detail in the DOM',
+  /异常/.test(swapDiag.alert) && swapDiag.detailShown,
+  `alert="${(swapDiag.alert ?? '').slice(0, 40)}" detail=${swapDiag.detailShown}`);
+
+// --- 10. injected mic dropout is told apart from a swap -----------------------
+const dropDiag = await page.evaluate(() => {
+  window.__doa.injectFault({ type: 'drop', mic: 2 });
+  const ev = window.__doa.jumpEvents().find((e) => e.kind === 'anomaly' && e.cause !== 'channel-swap');
+  const stats = window.__doa.jumpStats();
+  return ev ? {
+    cause: ev.cause, stage: ev.stage, mics: ev.implicatedMics,
+    events: stats.events, maxEvents: stats.maxEvents, segmentsHeld: stats.segmentsHeld,
+  } : { cause: null };
+});
+check('injected mic dropout is diagnosed as mic-dropout on M2, not a swap',
+  dropDiag.cause === 'mic-dropout' && dropDiag.mics?.join(',') === '2',
+  `cause=${dropDiag.cause} mics=[${dropDiag.mics ?? ''}]`);
+check('diagnostic log stays within its budget',
+  dropDiag.events <= dropDiag.maxEvents && dropDiag.segmentsHeld <= 4,
+  `events=${dropDiag.events}/${dropDiag.maxEvents} segments=${dropDiag.segmentsHeld}`);
 
 await browser.close();
 

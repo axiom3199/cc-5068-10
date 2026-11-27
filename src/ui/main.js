@@ -16,6 +16,7 @@
 import { renderScene } from '../core/synthesize.js';
 import { analyzeDirection } from '../core/analysis.js';
 import { DirectionTracker } from '../core/tracker.js';
+import { DirectionJumpDiagnostics } from '../core/jumpdiag.js';
 import { VirtualCamera, CameraController } from '../core/camera.js';
 import { analyzeArrayGeometry } from '../core/solver.js';
 import { planProbeForDecision } from '../core/disambiguation.js';
@@ -82,6 +83,10 @@ const state = {
   lastAnalysisPose: null,
   reanalysisPending: false,
   lastError: null,
+  jumpDiag: null,        // DirectionJumpDiagnostics, lazily created
+  pendingNote: {},       // operator-change note consumed by the next observe()
+  selectedJumpEvent: null,
+  fault: null,           // one-shot injected fault, consumed by the next runAnalysis
 };
 
 const player = new ChannelPlayer();
@@ -145,11 +150,30 @@ function rebuildScene() {
 }
 
 // ------------------------------------------------------------------ analysis
+// One-shot physical fault injection: rewire or silence recording channels
+// WITHOUT updating the declared channel map, so the analyser sees wrong data.
+function applyFault() {
+  const f = state.fault;
+  if (!f) return;
+  state.fault = null;
+  const chans = state.recording.channels;
+  if (f.type === 'swap') {
+    const [a, b] = f.mics;
+    const ca = state.channelMap[a];
+    const cb = state.channelMap[b];
+    [chans[ca], chans[cb]] = [chans[cb], chans[ca]];
+  } else if (f.type === 'drop') {
+    const ch = state.channelMap[f.mic];
+    chans[ch] = new Float32Array(chans[ch].length);
+  }
+}
+
 function runAnalysis() {
   state.lastError = null;
   try {
     clampWindow();
     const sc = rebuildScene();
+    applyFault();
     const startSample = Math.round(state.window.startSec * FS);
     const frameLength = Math.round(state.window.lengthSec * FS);
 
@@ -184,6 +208,20 @@ function runAnalysis() {
       performance.now() / 1000,
     );
     state.decision = decision;
+
+    // Direction-jump diagnostics: watch solver/truth divergence against the
+    // deferred-attribution reference. The pending note marks operator changes
+    // (geometry/wiring/source) so expected jumps are not false-reported.
+    if (!state.jumpDiag) state.jumpDiag = new DirectionJumpDiagnostics();
+    const jumpEvent = state.jumpDiag.observe({
+      analysis,
+      pose: { panDeg: state.camera.panDeg, tiltDeg: state.camera.tiltDeg },
+      decision,
+      recording: { channels: state.recording.channels, sampleRate: FS },
+      note: state.pendingNote,
+    });
+    state.pendingNote = {};
+    if (jumpEvent) state.selectedJumpEvent = jumpEvent.id;
 
     state.history.unshift({
       t: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
@@ -226,6 +264,7 @@ function renderAll() {
   renderResults();
   renderChannels();
   renderPairTable();
+  renderJumpDiag();
   renderDiagnostics();
   renderDecision();
   renderStatus();
@@ -493,6 +532,147 @@ function renderDiagnostics() {
   box.textContent = lines.join('\n');
 }
 
+// --------------------------------------------------------- jump diagnostics
+const JUMP_CAUSE_LABEL = {
+  'channel-swap': '通道互换',
+  'mic-dropout': '话筒掉线',
+  'sign-error': '时差符号错误',
+  'strong-reflection': '强反射',
+  'multi-peak-ambiguity': '多峰歧义',
+  'track-switch': '轨迹切换',
+  unexplained: '未明原因',
+  'axis-transform': '阵列/布局变换（预期）',
+  'source-moved': '声源移动（预期）',
+  'source-gone': '声源消失（预期）',
+};
+const JUMP_STAGE_LABEL = { tdoa: '时差估计', solve: '方向解算', track: '跟踪决策' };
+
+function renderJumpDiag() {
+  const diag = state.jumpDiag;
+  const budgetEl = $('jumpBudget');
+  const alertEl = $('jumpAlert');
+  const listEl = $('jumpEventList');
+  const detailEl = $('jumpEventDetail');
+  if (!budgetEl) return;
+  if (!diag) {
+    budgetEl.textContent = '';
+    alertEl.className = 'jump-alert idle';
+    alertEl.textContent = '等待分析…';
+    listEl.innerHTML = '';
+    detailEl.innerHTML = '';
+    return;
+  }
+  const stats = diag.stats();
+  budgetEl.textContent =
+    `帧 ${stats.frames} · 事件 ${stats.events}/${stats.maxEvents}（异常 ${stats.anomalies} / 预期 ${stats.expected}）`
+    + ` · 留存片段 ${stats.segmentsHeld}/${stats.maxSegments}`
+    + (stats.droppedEvents || stats.droppedSegments
+      ? ` · 已按预算丢弃 事件${stats.droppedEvents} 片段${stats.droppedSegments}` : '');
+
+  const events = diag.events();
+  const latestAnomaly = events.find((e) => e.kind === 'anomaly');
+  if (latestAnomaly) {
+    alertEl.className = 'jump-alert anomaly';
+    alertEl.textContent =
+      `异常 #${latestAnomaly.id}：${JUMP_CAUSE_LABEL[latestAnomaly.cause] ?? latestAnomaly.cause}`
+      + `（阶段：${JUMP_STAGE_LABEL[latestAnomaly.stage] ?? latestAnomaly.stage}`
+      + (latestAnomaly.jumpDeg != null ? `，跳变 ${latestAnomaly.jumpDeg}°` : '')
+      + (latestAnomaly.implicatedMics.length ? `，涉及 ${latestAnomaly.implicatedMics.map((m) => `M${m}`).join('/')}）` : '）');
+  } else {
+    alertEl.className = 'jump-alert ok';
+    alertEl.textContent = events.length
+      ? '仅有预期内变化（布局调整 / 声源移动），无异常跳变。'
+      : '未检测到方向跳变。';
+  }
+
+  listEl.innerHTML = '';
+  for (const ev of events) {
+    const div = document.createElement('div');
+    div.className = `jump-item ${ev.kind} ${state.selectedJumpEvent === ev.id ? 'selected' : ''}`;
+    const mics = ev.implicatedMics.length ? ` · ${ev.implicatedMics.map((m) => `M${m}`).join('/')}` : '';
+    div.innerHTML = `<span class="j-id">#${ev.id}</span>
+      <span class="j-cause">${JUMP_CAUSE_LABEL[ev.cause] ?? ev.cause}${ev.count > 1 ? ` ×${ev.count}` : ''}</span>
+      <span class="j-meta">${JUMP_STAGE_LABEL[ev.stage] ?? ev.stage}${ev.jumpDeg != null ? ` · ${ev.jumpDeg}°` : ''}${mics}</span>`;
+    div.addEventListener('click', () => {
+      state.selectedJumpEvent = state.selectedJumpEvent === ev.id ? null : ev.id;
+      renderJumpDiag();
+    });
+    listEl.appendChild(div);
+  }
+  if (!events.length) listEl.innerHTML = '<div class="jump-empty">暂无事件</div>';
+
+  const sel = events.find((e) => e.id === state.selectedJumpEvent);
+  if (!sel) { detailEl.innerHTML = ''; return; }
+  const rows = [];
+  rows.push(`<div class="jd-row"><span>结论</span><b>${escapeHtml(sel.reason)}</b></div>`);
+  if (sel.referenceAzEl) rows.push(`<div class="jd-row"><span>参照来向（世界）</span><b>方位 ${fmt(sel.referenceAzEl.azDeg)}° · 仰角 ${fmt(sel.referenceAzEl.elDeg)}°</b></div>`);
+  if (sel.reportedAzEl) rows.push(`<div class="jd-row"><span>报告来向（世界）</span><b>方位 ${fmt(sel.reportedAzEl.azDeg)}° · 仰角 ${fmt(sel.reportedAzEl.elDeg)}°</b></div>`);
+  if (sel.tauConsistency) {
+    const bad = sel.tauConsistency.perPair.filter((p) => !p.consistent);
+    rows.push(`<div class="jd-row"><span>时差一致性</span><b>${Math.round(sel.tauConsistency.consistentFrac * 100)}% 通道对与参照一致`
+      + (bad.length ? `；偏离：${bad.map((p) => `M${p.pair[0]}–M${p.pair[1]}(z=${p.z})`).join('，')}` : '')
+      + `</b></div>`);
+  }
+  if (sel.branchSupport?.reference) {
+    rows.push(`<div class="jd-row"><span>分支支撑</span><b>参照 ${Math.round(sel.branchSupport.reference.frac * 100)}%`
+      + (sel.branchSupport.reported ? ` · 报告 ${Math.round(sel.branchSupport.reported.frac * 100)}%` : '')
+      + (sel.branchSupport.retainable ? ' · 参照分支仍可保留' : ' · 参照分支失去麦对支撑')
+      + `</b></div>`);
+  }
+  const peakKeys = Object.keys(sel.peaks ?? {});
+  if (peakKeys.length) {
+    rows.push(`<div class="jd-row"><span>候选峰</span><b>${peakKeys.map((k) => {
+      const [a, b] = k.split('-');
+      return `M${a}–M${b}: ${sel.peaks[k].map((p) => `${(p.lagSec * 1e6).toFixed(0)}µs×${p.prominence}`).join(' / ')}`;
+    }).join('；')}</b></div>`);
+  }
+  const v = sel.verifyResult;
+  if (v) {
+    rows.push(`<div class="jd-row"><span>复跑核验</span><b class="${v.conclusion === 'confirmed' ? 'ok-text' : 'warn-text'}">${
+      { confirmed: '已确认', refuted: '被证伪', 'not-applicable': '不适用' }[v.conclusion] ?? v.conclusion
+    }：${v.steps.map((s) => `${s.step}${s.ok == null ? '' : s.ok ? '✓' : '✗'}`).join(' → ')}</b></div>`);
+  }
+  const canReplay = !!sel.segment;
+  detailEl.innerHTML = rows.join('')
+    + `<div class="jd-actions">
+        <button class="btn btn-ghost" type="button" data-act="locate">定位到窗口</button>
+        <button class="btn btn-ghost" type="button" data-act="replay" ${canReplay ? '' : 'disabled'}>${canReplay ? '回放该段' : (sel.segmentEvicted ? '片段已按预算丢弃' : '无留存片段')}</button>
+        <button class="btn btn-ghost" type="button" data-act="verify">复跑核验</button>
+      </div>`;
+  detailEl.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', () => jumpEventAction(sel, btn.dataset.act));
+  });
+}
+
+function jumpEventAction(ev, act) {
+  const diag = state.jumpDiag;
+  if (!diag) return;
+  if (act === 'locate') {
+    const ctx = ev.solveContext;
+    state.window.startSec = Math.min(
+      Math.max(0, RECORDING_SEC - state.window.lengthSec - 0.01),
+      ctx.startSample / ctx.sampleRate,
+    );
+    state.window.lengthSec = ctx.frameLength / ctx.sampleRate;
+    $('winStart').value = String(state.window.startSec);
+    $('winStartOut').textContent = `${state.window.startSec.toFixed(2)} s`;
+    $('winLen').value = String(state.window.lengthSec);
+    $('winLenOut').textContent = `${state.window.lengthSec.toFixed(3)} s`;
+    renderJumpDiag();
+  } else if (act === 'replay' && ev.segment) {
+    // Mix the retained mic-ordered segment down to mono and play it back.
+    const n = ev.segment.frameLength;
+    const mix = new Float32Array(n);
+    for (const ch of ev.segment.channels) {
+      for (let i = 0; i < Math.min(n, ch.length); i++) mix[i] += ch[i] / ev.segment.channels.length;
+    }
+    player.play('jump', mix, ev.segment.sampleRate, `事件 #${ev.id} 片段`);
+  } else if (act === 'verify') {
+    diag.verify(ev.id);
+    renderJumpDiag();
+  }
+}
+
 function renderDecision() {
   const box = $('decisionBox');
   const log = $('decisionLog');
@@ -691,7 +871,9 @@ function buildMicEditor() {
       if (!Number.isFinite(v)) return;
       state.positions[i][k] = v / 100;
       state.tracker = null;
+      state.jumpDiag = null;
       state.probe = null;
+      state.pendingNote = { ...state.pendingNote, geometryChanged: true };
       runAnalysis();
     });
   });
@@ -734,7 +916,9 @@ function setupMicDrag() {
     if (dragging < 0) return;
     dragging = -1;
     state.tracker = null;
+    state.jumpDiag = null;
     state.probe = null;
+    state.pendingNote = { ...state.pendingNote, geometryChanged: true };
     buildMicEditor();
     try { runAnalysis(); } catch { /* rendered */ }
   };
@@ -750,7 +934,9 @@ function bindControls() {
       state.layout = name;
       state.positions = LAYOUTS[name].positions.map((p) => p.slice());
       state.tracker = null;
+      state.jumpDiag = null;
       state.probe = null;
+      state.pendingNote = { ...state.pendingNote, geometryChanged: true };
       document.querySelectorAll('.btn-chip[data-layout]').forEach((b) => b.classList.toggle('active', b === btn));
       buildMicEditor();
       runAnalysis();
@@ -758,10 +944,15 @@ function bindControls() {
   });
 
   ['srcAz', 'srcEl', 'srcDist', 'srcSnr'].forEach((id) =>
-    $(id).addEventListener('input', () => { readSourceControls(); }));
+    $(id).addEventListener('input', () => {
+      readSourceControls();
+      state.pendingNote = { ...state.pendingNote, sourceChanged: true };
+    }));
   $('srcOn').addEventListener('change', () => {
     readSourceControls();
+    state.pendingNote = { ...state.pendingNote, sourceChanged: true };
     state.tracker = null;
+    state.jumpDiag = null;
     state.probe = null;
     runAnalysis();
   });
@@ -833,11 +1024,13 @@ function bindControls() {
     }
     // wiring[mic] = recording channel that physically carries mic mic
     state.wiring = perm;
+    state.pendingNote = { ...state.pendingNote, wiringChanged: true };
     updateChannelMapNote();
     runAnalysis();
   });
   $('resetChBtn').addEventListener('click', () => {
     state.wiring = null;
+    state.pendingNote = { ...state.pendingNote, wiringChanged: true };
     updateChannelMapNote(false);
     runAnalysis();
   });
@@ -845,6 +1038,24 @@ function bindControls() {
   $('pairSelect').addEventListener('change', (e) => {
     state.selectedPairIdx = Number(e.target.value);
     renderXcorr();
+  });
+
+  // Fault injection: physically corrupt the next analysis frame (one shot) so
+  // the jump diagnostics can be exercised from the UI.
+  $('faultSwapBtn')?.addEventListener('click', () => {
+    const n = state.positions.length;
+    if (n < 2) return;
+    const a = Math.floor(Math.random() * n);
+    let b = Math.floor(Math.random() * (n - 1));
+    if (b >= a) b += 1;
+    state.fault = { type: 'swap', mics: [a, b] };
+    runAnalysis();
+  });
+  $('faultDropBtn')?.addEventListener('click', () => {
+    const n = state.positions.length;
+    if (n < 2) return;
+    state.fault = { type: 'drop', mic: Math.floor(Math.random() * n) };
+    runAnalysis();
   });
 
   $('stopBtn').addEventListener('click', () => {
@@ -901,18 +1112,31 @@ window.__doa = {
   state,
   runAnalysis,
   setScene({ layout, positions, source, camera, c, window: win, wiring } = {}) {
+    const note = {};
     if (layout && LAYOUTS[layout]) {
       state.layout = layout;
       state.positions = LAYOUTS[layout].positions.map((p) => p.slice());
+      note.geometryChanged = true;
     }
-    if (positions) state.positions = positions.map((p) => p.slice());
-    if (source) Object.assign(state.source, source);
+    if (positions) {
+      state.positions = positions.map((p) => p.slice());
+      note.geometryChanged = true;
+    }
+    if (source) {
+      Object.assign(state.source, source);
+      note.sourceChanged = true;
+    }
     if (camera) Object.assign(state.camera, camera);
     if (c != null) state.c = c;
     if (win) Object.assign(state.window, win);
-    if (wiring !== undefined) state.wiring = wiring;
+    if (wiring !== undefined) {
+      state.wiring = wiring;
+      note.wiringChanged = true;
+    }
     state.tracker = null;
+    state.jumpDiag = null;
     state.probe = null;
+    state.pendingNote = { ...state.pendingNote, ...note };
     syncSourceControls();
     $('cInput').value = String(state.c);
     $('cOut').textContent = `${state.c} m/s`;
@@ -925,5 +1149,23 @@ window.__doa = {
   candidatesWorld,
   setFollow(on) {
     if (!!on !== state.follow) $('followBtn').click();
+  },
+  // Direction-jump diagnostics surface.
+  jumpEvents() {
+    return state.jumpDiag ? state.jumpDiag.events() : [];
+  },
+  jumpStats() {
+    return state.jumpDiag ? state.jumpDiag.stats() : null;
+  },
+  verifyJump(id) {
+    return state.jumpDiag ? state.jumpDiag.verify(id) : null;
+  },
+  selectJumpEvent(id) {
+    state.selectedJumpEvent = id;
+    renderJumpDiag();
+  },
+  injectFault(f) {
+    state.fault = f;
+    return runAnalysis();
   },
 };

@@ -174,6 +174,21 @@
       </div>
 
       <div class="panel">
+        <div class="panel-head">
+          <h2>方向跳变诊断</h2>
+          <span class="hint">以暂缓归属的可信来向为参照，异常定位到阶段与通道对</span>
+        </div>
+        <div id="jumpAlert" class="jump-alert idle">等待分析…</div>
+        <div id="jumpEventList" class="jump-list"></div>
+        <div id="jumpEventDetail" class="jump-detail"></div>
+        <div class="btn-row">
+          <button id="faultSwapBtn" class="btn btn-ghost" type="button">注入通道互换</button>
+          <button id="faultDropBtn" class="btn btn-ghost" type="button">注入话筒掉线</button>
+        </div>
+        <p class="note" id="jumpBudget"></p>
+      </div>
+
+      <div class="panel">
         <div class="panel-head"><h2>诊断</h2></div>
         <pre id="diagBox" class="diag">等待分析…</pre>
       </div>
@@ -188,6 +203,7 @@
       <li>结果区给出首选来向、其他候选、可信范围与拟合残差；证据不足时会明确显示「证据不足」及原因，且不会给出可信方向。</li>
       <li>「互相关峰」显示所选通道对的 GCC-PHAT 曲线、实测峰与几何允许的时差带；「方向与几何约束」显示候选扇形（俯视 + 侧视）。</li>
       <li>「跟拍：开」后，跟踪器根据每帧结果决定转向或暂缓；平面阵出现镜像时先保持上次可信方向，用「探针转头」改变阵列姿态后可排除一支。</li>
+      <li>「方向跳变诊断」以来向跟踪的暂缓归属为参照，监测声源稳定但估计方向突跳的情况：通道互换、话筒掉线、符号错误、强反射、多峰歧义各有独立原因与阶段定位；「注入通道互换 / 注入话筒掉线」可现场制造故障观察诊断。每个事件可「定位到窗口」「回放该段」（原始多通道片段混音）与「复跑核验」（据记录证据重解算验证结论）。</li>
       <li>「通道试听」可单独播放各声道；「打乱录制通道」用于验证通道顺序确实被显式处理。</li>
     </ol>
     <p class="note">推断只接收 channels、sampleRate、通道映射、话筒位置与声速；页面上的仿真真值仅用于视觉校验，从不传入分析内核。</p>

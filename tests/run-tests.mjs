@@ -5,6 +5,11 @@ import { solveDirection, analyzeArrayGeometry } from '../src/core/solver.js';
 import { analyzeDirection, loudestChannelBearing } from '../src/core/analysis.js';
 import { runTrackingTrial } from './tracking-eval.mjs';
 import { runProbeTrial, runScriptedDisambiguation } from './probe-eval.mjs';
+import {
+  scenarioChannelSwap, scenarioMicDropout, scenarioStrongReflection,
+  scenarioMultiPeakFlip, scenarioAxisTransform, scenarioSourceMoved, scenarioLogCost,
+  evaluateScenario,
+} from './jump-eval.mjs';
 import { azElToUnit, angularSeparationDeg, unitToAzEl, arrayToWorld } from '../src/core/geometry.js';
 import { renderScene } from '../src/core/synthesize.js';
 
@@ -500,6 +505,47 @@ test('Missing/invalid source evidence is explicit in the result object', ({ chec
   check(an.direction.reportable === false, 'insufficient result must be marked non-reportable');
   check(an.direction.candidates.every((c) => c.plausible === false), 'insufficient result must not mark any candidate plausible');
   note(`insufficient: ${an.direction.reason}`);
+});
+
+// ---------------------------------------------------------------------------
+test('Jump diag: swapped channels are localized to the swapped mics (tdoa stage)', ({ check, note }) => {
+  const r = evaluateScenario(scenarioChannelSwap, (m) => note(m));
+  for (const f of r.failures) check(false, f);
+  check(r.event.implicatedMics.join(',') === '1,2', `implicated mics ${r.event.implicatedMics}`);
+  check(r.verify.conclusion === 'confirmed', `verify ${r.verify.conclusion}`);
+});
+
+test('Jump diag: a dropped mic is told apart from a channel swap', ({ check, note }) => {
+  const r = evaluateScenario(scenarioMicDropout, (m) => note(m));
+  for (const f of r.failures) check(false, f);
+  check(r.event.cause === 'mic-dropout', `cause ${r.event.cause}`);
+  check(r.event.implicatedMics.join(',') === '2', `implicated mics ${r.event.implicatedMics}`);
+});
+
+test('Jump diag: strong reflection is separated from a real source move', ({ check, note }) => {
+  const r = evaluateScenario(scenarioStrongReflection, (m) => note(m));
+  for (const f of r.failures) check(false, f);
+  check(r.event.cause === 'strong-reflection', `cause ${r.event.cause}`);
+  check(r.verify.conclusion === 'confirmed', `verify ${r.verify.conclusion}`);
+});
+
+test('Jump diag: a branch flip keeps both pair-supported branches retainable', ({ check, note }) => {
+  const r = evaluateScenario(scenarioMultiPeakFlip, (m) => note(m));
+  for (const f of r.failures) check(false, f);
+  check(r.event.branchSupport.retainable === true, 'reference branch must stay pair-supported');
+});
+
+test('Jump diag: expected changes are not false-reported as anomalies', ({ check, note }) => {
+  const geo = evaluateScenario(scenarioAxisTransform, (m) => note(m));
+  for (const f of geo.failures) check(false, f);
+  const moved = evaluateScenario(scenarioSourceMoved, (m) => note(m));
+  for (const f of moved.failures) check(false, f);
+  check(moved.event.kind === 'expected', `source move reported as ${moved.event.kind}`);
+});
+
+test('Jump diag: event and segment logs stay bounded under an anomaly flood', ({ check, note }) => {
+  const r = evaluateScenario(scenarioLogCost, (m) => note(m));
+  for (const f of r.failures) check(false, f);
 });
 
 // ---------------------------------------------------------------------------
